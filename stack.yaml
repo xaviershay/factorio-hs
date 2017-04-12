@@ -1,0 +1,8 @@
+flags: {}
+extra-package-dbs: []
+packages:
+- '.'
+extra-deps:
+- gasp-1.0.1.0
+- glpk-hs-0.5
+resolver: lts-8.9
