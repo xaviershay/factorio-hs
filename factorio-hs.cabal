@@ -28,6 +28,7 @@ library
                      , aeson
                      , containers
                      , vector
+                     , graphviz
   default-language:    Haskell2010
 
 executable factorio-hs-exe
@@ -47,6 +48,7 @@ executable factorio-hs-exe
                      , aeson
                      , containers
                      , vector
+                     , graphviz
   default-language:    Haskell2010
 
 test-suite factorio-hs-test

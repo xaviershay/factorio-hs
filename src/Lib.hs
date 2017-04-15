@@ -5,7 +5,9 @@ module Lib
   ( someFunc
   ) where
 
+import Debug.Trace
 import qualified Data.Text as T
+import qualified Data.Text.Lazy as TL
 
 import qualified Data.Map as M
 import qualified Data.Vector as V
@@ -22,45 +24,74 @@ import System.FilePath
 import qualified Scripting.Lua as Lua
 import Control.Monad
 import qualified Data.ByteString as BS
-import qualified Data.Aeson as Aeson
+import qualified Data.Aeson
 import Data.Aeson.Types
 import Scripting.Lua.Aeson
+import Control.Applicative
+
+import Data.GraphViz as GV
+import qualified Data.GraphViz.Attributes.Complete as GVAC
 
 type Item = T.Text
 type AssemblerSpec = () -- TODO
 
-data RateSpec = Auto | Target Double
-data ProductionNode = ProductionNode Recipe RateSpec AssemblerSpec
+data RateSpec = Auto | Target Double deriving (Show)
+data ProductionNode = ProductionNode Recipe RateSpec AssemblerSpec deriving (Show)
 
 type ProductionGraph = G.Gr ProductionNode Item
 
 data Recipe = Recipe
   { name :: T.Text
   , duration :: Double
-  , items :: [(Item, Double)]
+  , items :: [Ingredient]
+  , category :: T.Text
   } deriving (Show)
 
-toTuple :: Aeson.Value -> Parser (Item, Double)
-toTuple (Aeson.Array x) = do
-  item <- parseJSON (x V.! 0)
-  amount <- parseJSON (x V.! 1)
+data Ingredient = Ingredient Item Double deriving (Show)
 
-  return (item, amount)
-toTuple _ = mzero
+instance FromJSON Ingredient where
+  parseJSON x = case x of
+    Object o -> Ingredient
+                  <$> o .: "name"
+                  <*> o .: "amount"
 
+    Array _ -> do
+      (n, a) <- parseJSON x
 
+      return $ Ingredient n a
 
-instance Aeson.FromJSON Recipe where
-  parseJSON (Aeson.Object v) = do
-    n       <- v Aeson..: "name"
-    inputs  <- v Aeson..: "ingredients"
-    inputs' <- mapM toTuple inputs
+    invalid -> typeMismatch "Ingredient" invalid
 
-    return $ mkRecipe n 1 inputs'
+parseResult v = do
+  item  <- v .: "result"
+  count <- v .:? "result_count" .!= 1.0
+
+  return [Ingredient item count]
+
+instance FromJSON Recipe where
+  parseJSON (Object v) = do
+    n        <- v .: "name"
+    inputs   <- v .: "ingredients"
+    outputs  <- (v .: "results") <|>
+                parseResult v <|>
+                fail "Recipe must have one of: results, result"
+    category <- v .:? "category" .!= "crafting"
+
+    return $ Recipe {
+                 name = n
+               , duration = 1
+               , items = map (\(Ingredient n a) -> Ingredient n (-a)) inputs <> outputs
+               , category = category
+               }
 
 -- ("diesel-locomotive",Object (fromList [("enabled",Bool False),("in gredients",Array [Array [String "engine-unit",Number 20.0],Array [String "electronic-circu it",Number 10.0],Array [String "steel-plate",Number 30.0]]),("result",String "diesel-locom otive"),("name",String "diesel-locomotive"),("type",String "recipe")]))
 
-mkRecipe n d is = Recipe {name = n, duration = d, items = is}
+mkRecipe n d is = Recipe {
+  name = n
+  , duration = d
+  , items = is
+  , category = "crafting"
+  }
 
 n *& v = linCombination [(n, v)]
 
@@ -69,29 +100,29 @@ lp graph =
   execLPM $ do
     setDirection Min
     mapM_ addConstraintsForNode blah
-    setObjective $ linCombination [(1, "0"), (1, "1")]
-    --equal' "node-ratio" (2 *& "node") (1 *& "iron-plate")
-    --equal' "node-ratio" ((-1) *& "node") (1 *& "iron-ore")
-    mapM (equalTo (1 *& "1-iron-plate")) [(100)]
   where
     blah = G.ufold f [] graph
-    f (_, n, node, out) xs = (n, node, out):xs
+    f (inlinks, n, node, out) xs = (n, node, inlinks, out):xs
     addConstraintsForNode (n,
       (ProductionNode (Recipe { duration = d, items = is }) rateSpec _),
-      links) = do
-                mapM_ (\(i, r) -> equal' ("node-" <> show n <> "-ratio") (r *& (T.pack . show) n) (1 *& ((T.pack . show) n <> "-" <> i))) is
-                mapM_ (\(item, targetN) -> equal' "link" (1 *& ((T.pack . show) n <> "-" <> item)) ((-1) *& ((T.pack . show) targetN <> "-" <> item))) links
+      incomingLinks,
+      outgoingLinks) = do
+                mapM_ (\(Ingredient i r) -> equal' ("node-" <> show n <> "-ratio") (r *& (T.pack . show) n) (1 *& ((T.pack . show) n <> "-" <> i))) is
+                mapM_ (\(item, targetN) -> addLink n targetN item) outgoingLinks
+                mapM_ (\(item, sourceN) -> addLink sourceN n item) incomingLinks
 
-testingGraph :: ProductionGraph
-testingGraph = G.mkGraph nodes edges
-  where
-    nodes = [ (0, ProductionNode miner Auto ())
-            , (1, ProductionNode furnace (Target 10) ())
-            ]
-    edges = [(0, 1, "iron-ore")]
+                case rateSpec of
+                  Target t ->
+                    equalTo' ("node-" <> show n <> "-target") (1 *& (T.pack . show) n) t
+                  Auto     -> setObjective (1 *& ((T.pack . show) n))
 
-miner = mkRecipe "miner" 1 [("iron-ore", 1)]
-furnace = mkRecipe "furnace" 1 [("iron-ore", (-1)), ("iron-plate", 2)]
+-- Supply must be less than consumption
+addLink from to item = do
+  geq' "link"    (1 *& ((T.pack . show) from <> "-" <> item))
+                ((-1) *& ((T.pack . show) to <> "-" <> item))
+
+miner = mkRecipe "miner" 1 [Ingredient "iron-ore" 1]
+furnace = mkRecipe "furnace" 1 [Ingredient "iron-ore" (-1), Ingredient "iron-plate" 2]
 
 pretty LP { constraints = cs } = T.intercalate "\n" $ map (T.pack . show) cs
 
@@ -156,44 +187,78 @@ loadLua = do
   Lua.getglobal l "data"
   Lua.getfield l (-1) "raw"
   Lua.getfield l (-1) "recipe"
-  Lua.getfield l (-1) "diesel-locomotive"
+  --Lua.getfield l (-1) "diesel-locomotive"
+  --Lua.getfield l (-1) "small-electric-pole"
 
   x <- Lua.istable l (-1)
   putStrLn $ show x
 
   rs <- Lua.peek l (-1)
-  putStrLn . show $ ((parseMaybe parseJSON (fromJust rs)) :: Maybe Recipe)
+  --putStrLn . show $ rs
 
---getRecipes l = do
---  hasNext <- Lua.next l (-1)
---  if hasNext then do
---    k <- Lua.peek l (-2)
---    v <- Lua.peek l (-1)
---    Lua.pop l 1
---    getRecipes l >>= \xs -> return $ (fromJust k, fromJust v):xs
---  else return []
+  case parseEither parseJSON (fromJust rs) :: Either String (M.Map String Recipe) of
+    Left e -> putStrLn e
+    Right recipes -> do
+      let gvsrc = "digraph {\"copper-cable\" [factorioTarget = 5]; \"copper-plate\" -> \"copper-cable\"}"
+      let g = (GV.parseDotGraph gvsrc :: DotGraph String)
 
---getTable :: (Lua.StackValue k, Lua.StackValue v) => Lua.LuaState -> Int -> IO [(k,v)]
---getTable lua i = do
---  Lua.pushnil lua
---  getTable' (i - 1)
---  where
---    getTable' idx = do
---      hasNext <- Lua.next lua idx
---      if hasNext then do
---        k <- Lua.peek lua (-2)
---        v <- Lua.peek lua (-1)
---        Lua.pop lua 1
---        getTable' idx >>= \tl -> return $ (fromJust k, fromJust v):tl
---        else return []
---  Lua.loadstring l "return 5"
---  x <- Lua.peek l (-1)
---  putStrLn $ show (x :: Maybe Int)
---
---  putStrLn "ok"
+      putStrLn "---"
+      G.prettyPrint $ dotToProductionGraph recipes g
+      putStrLn "---"
+      putStrLn . T.unpack . pretty . lp $ dotToProductionGraph recipes g
+      print =<< glpSolveVars mipDefaults (lp $ dotToProductionGraph recipes g)
+      --forM_ (M.elems recipes) putRecipeLn
+
+
+putRecipeLn :: Recipe -> IO ()
+putRecipeLn (Recipe { name = name }) = do
+  putStrLn . T.unpack $ name
+
+  --putStrLn . show $ ((parseEither parseJSON (fromJust rs)) :: Either String (M.Map String Recipe))
+  --putStrLn . show $ ((parseEither parseJSON (fromJust rs)) :: Either String (Recipe))
+
+
+dotToProductionGraph :: M.Map String Recipe -> DotGraph String -> ProductionGraph
+dotToProductionGraph recipes dg = G.mkGraph ns es
+  where
+    ns = zip [0..] (map toPN $ GV.graphNodes dg)
+    es = map (toPNE nodeTable) $ GV.graphEdges dg
+
+    nodeTable :: M.Map String G.Node
+    nodeTable = M.fromList (zip (map nodeName . GV.graphNodes $ dg) [0..])
+    nodeName (DotNode n _) = n
+    toPN (DotNode recipeName as) =
+      case M.lookup recipeName recipes of
+        Just r -> ProductionNode r (targetFrom as) ()
+        Nothing -> error $ "recipe not found: " <> recipeName
+
+    toPNE :: (M.Map String G.Node) -> DotEdge String -> (G.Node, G.Node, T.Text)
+    toPNE table (DotEdge from to as) =
+      (fromJust $ M.lookup from table,
+       fromJust $ M.lookup to table, T.pack from)
+
+    targetFrom as = case firstJust $ map extractTarget as of
+                      Just t  -> t
+                      Nothing -> Auto
+    extractTarget (GVAC.UnknownAttribute "factorioTarget" t) = Just $ Target (read . TL.unpack $ t)
+    extractTarget _ = Nothing
+
+    firstJust (Just x:xs) = Just x
+    firstJust (_:xs) = firstJust xs
+    firstJust []     = Nothing
+
+
+testingGraph :: ProductionGraph
+testingGraph = G.mkGraph nodes edges
+  where
+    nodes = [ (0, ProductionNode miner Auto ())
+            , (1, ProductionNode furnace (Target 10) ())
+            ]
+    edges = [(0, 1, "iron-ore")]
 
 someFunc :: IO ()
 someFunc = loadLua
+--someFunc = testDot
 
 someFunc2 :: IO ()
 someFunc2 =
