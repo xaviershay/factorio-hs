@@ -1,9 +1,9 @@
 module Main where
 
 import System.Environment (getArgs)
-import System.Exit (die)
+import System.Exit        (die)
 
-import Lib
+import Factorio
 
 main :: IO ()
 main = do

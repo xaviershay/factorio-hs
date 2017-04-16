@@ -1,0 +1,9 @@
+digraph {
+  "copper-cable"
+  "copper-plate"
+  "iron-plate"
+  "electronic-circuit" [factorioTarget = 10]
+
+  "iron-plate" -> "electronic-circuit";
+  "copper-plate" -> "copper-cable" -> "electronic-circuit";
+}
