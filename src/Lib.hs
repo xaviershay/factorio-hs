@@ -3,11 +3,19 @@
 
 module Lib
   ( someFunc
+  , someFunc2
+  , loadDotFile
+  , loadFactorioData
+  , solveDot
+  , putDotGraph
+  , dotToProductionGraph
   ) where
 
 import Debug.Trace
+import Data.Tuple (swap)
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
+import qualified Data.Text.Lazy.IO as TL
 
 import qualified Data.Map as M
 import qualified Data.Vector as V
@@ -30,6 +38,7 @@ import Scripting.Lua.Aeson
 import Control.Applicative
 
 import Data.GraphViz as GV
+import Data.GraphViz.Types.Canonical as GVTC
 import qualified Data.GraphViz.Attributes.Complete as GVAC
 
 type Item = T.Text
@@ -40,6 +49,8 @@ data ProductionNode = ProductionNode Recipe RateSpec AssemblerSpec deriving (Sho
 
 type ProductionGraph = G.Gr ProductionNode Item
 
+type ProductionData = M.Map Item Recipe
+
 data Recipe = Recipe
   { name :: T.Text
   , duration :: Double
@@ -48,6 +59,48 @@ data Recipe = Recipe
   } deriving (Show)
 
 data Ingredient = Ingredient Item Double deriving (Show)
+
+loadDotFile :: FilePath -> IO (DotGraph String)
+loadDotFile path = do
+  contents <- TL.readFile path
+
+  return $ GV.parseDotGraph contents
+
+loadFactorioData :: FilePath -> IO ProductionData
+loadFactorioData path = do
+  l <- Lua.newstate
+  e <- Lua.openlibs l
+  e <- addPackagePath l packagePath
+  Lua.getglobal l "package"
+  Lua.getfield l (-1) "path"
+
+  e <- Lua.loadfile l $ dataPath <> "/core/lualib/dataloader.lua"
+  e <- Lua.call l 0 0
+  e <- Lua.loadfile l "patch.lua"
+  e <- Lua.call l 0 0
+  dirs <- listDirectories dataPath
+  forM_ dirs $ \modDir -> do
+    -- TODO Reset package path
+    -- TODO Clear loaded table
+    addPackagePath l modDir
+
+    e <- Lua.loadfile l (joinPath [modDir, "data.lua"])
+    e <- Lua.call l 0 0
+
+    return ()
+
+  Lua.getglobal l "data"
+  Lua.getfield l (-1) "raw"
+  Lua.getfield l (-1) "recipe"
+
+  rs <- Lua.peek l (-1)
+
+  case parseEither parseJSON (fromJust rs) of
+    Left e        -> fail e
+    Right recipes -> return recipes
+
+putDotGraph :: DotGraph String -> IO ()
+putDotGraph = TL.putStrLn . GV.printDotGraph
 
 instance FromJSON Ingredient where
   parseJSON x = case x of
@@ -94,6 +147,119 @@ mkRecipe n d is = Recipe {
   }
 
 n *& v = linCombination [(n, v)]
+
+--type ProductionGraph = G.Gr ProductionNode Item
+
+dotToProductionGraph :: (Ord a) => ProductionData -> DotGraph a -> G.Gr (GV.DotNode a) (GV.DotEdge a)
+dotToProductionGraph recipes dg = G.mkGraph ns es
+  where
+    nodeName (DotNode n _) = n
+
+    ns = zip [0..] (GV.graphNodes dg)
+
+    nodeTable = M.fromList . map (\(x, y) -> (nodeName y, x)) $ ns
+
+    es = map (toE nodeTable) $ GV.graphEdges dg
+
+    -- TODO: Remove use of fromJust
+    toE table e@(DotEdge from to as) =
+      ( fromJust $ M.lookup from table
+      , fromJust $ M.lookup to table
+      , e)
+
+    --targetFrom as = case firstJust $ map extractTarget as of
+    --                  Just t  -> t
+    --                  Nothing -> Auto
+    --extractTarget (GVAC.UnknownAttribute "factorioTarget" t) = Just $ Target (read . TL.unpack $ t)
+    --extractTarget _ = Nothing
+
+    --firstJust (Just x:xs) = Just x
+    --firstJust (_:xs) = firstJust xs
+    --firstJust []     = Nothing
+
+
+--type ProductionGraph = G.Gr ProductionNode Item
+solve :: (Ord a) => ProductionData -> (a -> ProductionNode) -> (b -> Item) -> G.Gr a b -> IO (M.Map a Double)
+
+solve recipes fn fe input = do
+  let problem = lp2 (G.nemap fn fe input)
+  (_, result) <- glpSolveVars mipDefaults problem
+
+  case result of
+    Just (_, varMap) -> return . M.fromList $ map
+                        (\(n, s) -> (s, fromJust $ M.lookup (T.pack . show $ n) varMap))
+                        (G.labNodes input)
+    Nothing          -> return M.empty
+
+        --print =<< glpSolveVars mipDefaults (lp testingGraph)
+lp2 :: ProductionGraph -> LP T.Text Double
+lp2 graph =
+  execLPM $ do
+    setDirection Min
+    mapM_ addConstraintsForNode blah
+  where
+    blah = G.ufold f [] graph
+    f (inlinks, n, node, out) xs = (n, node, inlinks, out):xs
+    addConstraintsForNode (n,
+      (ProductionNode (Recipe { duration = d, items = is }) rateSpec _),
+      incomingLinks,
+      outgoingLinks) = do
+                mapM_ (\(Ingredient i r) -> equal' ("node-" <> show n <> "-ratio") (r *& (T.pack . show) n) (1 *& ((T.pack . show) n <> "-" <> i))) is
+                mapM_ (\(item, targetN) -> addLink n targetN item) outgoingLinks
+                mapM_ (\(item, sourceN) -> addLink sourceN n item) incomingLinks
+
+                case rateSpec of
+                  Target t ->
+                    equalTo' ("node-" <> show n <> "-target") (1 *& (T.pack . show) n) t
+                  Auto     -> setObjective (1 *& ((T.pack . show) n))
+
+dotAugment :: DotGraph String -> M.Map (GV.DotNode String) Double -> DotGraph String
+dotAugment existing rates = mapNodes addSolution existing
+  where
+    addSolution n@(DotNode name as) = case M.lookup n rates of
+      Just rate -> DotNode name (GVAC.customAttribute "factorioRate" (TL.pack . show $ rate):as)
+      Nothing   -> n
+
+mapNodes :: (DotNode a -> DotNode a) -> DotGraph a -> DotGraph a
+mapNodes f x@DotGraph { graphStatements = y@GVTC.DotStmts { nodeStmts = ns} } =
+  x { graphStatements = y { nodeStmts = map f ns }}
+
+solveDot :: ProductionData -> DotGraph String -> IO (DotGraph String)
+solveDot recipes dot = do
+  x <- s
+
+  return (dotAugment dot x)
+
+  where
+    inputGraph = dotToProductionGraph recipes dot
+    s = solve recipes toPN toPE inputGraph
+
+    toPN :: DotNode String -> ProductionNode
+    toPN (DotNode recipeName as) =
+      case M.lookup (T.pack recipeName) recipes of
+        Just r -> ProductionNode r (targetFrom as) ()
+        Nothing -> error $ "recipe not found: " <> recipeName
+
+    toPE :: DotEdge String -> Item
+    toPE (DotEdge from to as) = T.pack from
+
+    --toPE :: DotEdge String -> (G.Node, G.Node, Item)
+     -- (fromJust $ M.lookup from table,
+     --  fromJust $ M.lookup to table, T.pack from)
+
+    targetFrom as = case firstJust $ map extractTarget as of
+                      Just t  -> t
+                      Nothing -> Auto
+    extractTarget (GVAC.UnknownAttribute "factorioTarget" t) = Just $ Target (read . TL.unpack $ t)
+    extractTarget _ = Nothing
+
+    firstJust (Just x:xs) = Just x
+    firstJust (_:xs) = firstJust xs
+    firstJust []     = Nothing
+  -- graphElemsToDot nonClusteredParams ns es
+    -- TEMPORARY
+    ns = map (\(_, DotNode n as) -> (n, as)) $ G.labNodes inputGraph
+    es = map (\(_, _, DotEdge f t as) -> (f, t, as)) $ G.labEdges inputGraph
 
 lp :: ProductionGraph -> LP T.Text Double
 lp graph =
@@ -203,12 +369,11 @@ loadLua = do
       let g = (GV.parseDotGraph gvsrc :: DotGraph String)
 
       putStrLn "---"
-      G.prettyPrint $ dotToProductionGraph recipes g
-      putStrLn "---"
-      putStrLn . T.unpack . pretty . lp $ dotToProductionGraph recipes g
-      print =<< glpSolveVars mipDefaults (lp $ dotToProductionGraph recipes g)
+      --G.prettyPrint $ dotToProductionGraph recipes g
+      --putStrLn "---"
+      --putStrLn . T.unpack . pretty . lp $ dotToProductionGraph recipes g
+      --print =<< glpSolveVars mipDefaults (lp $ dotToProductionGraph recipes g)
       --forM_ (M.elems recipes) putRecipeLn
-
 
 putRecipeLn :: Recipe -> IO ()
 putRecipeLn (Recipe { name = name }) = do
@@ -217,35 +382,6 @@ putRecipeLn (Recipe { name = name }) = do
   --putStrLn . show $ ((parseEither parseJSON (fromJust rs)) :: Either String (M.Map String Recipe))
   --putStrLn . show $ ((parseEither parseJSON (fromJust rs)) :: Either String (Recipe))
 
-
-dotToProductionGraph :: M.Map String Recipe -> DotGraph String -> ProductionGraph
-dotToProductionGraph recipes dg = G.mkGraph ns es
-  where
-    ns = zip [0..] (map toPN $ GV.graphNodes dg)
-    es = map (toPNE nodeTable) $ GV.graphEdges dg
-
-    nodeTable :: M.Map String G.Node
-    nodeTable = M.fromList (zip (map nodeName . GV.graphNodes $ dg) [0..])
-    nodeName (DotNode n _) = n
-    toPN (DotNode recipeName as) =
-      case M.lookup recipeName recipes of
-        Just r -> ProductionNode r (targetFrom as) ()
-        Nothing -> error $ "recipe not found: " <> recipeName
-
-    toPNE :: (M.Map String G.Node) -> DotEdge String -> (G.Node, G.Node, T.Text)
-    toPNE table (DotEdge from to as) =
-      (fromJust $ M.lookup from table,
-       fromJust $ M.lookup to table, T.pack from)
-
-    targetFrom as = case firstJust $ map extractTarget as of
-                      Just t  -> t
-                      Nothing -> Auto
-    extractTarget (GVAC.UnknownAttribute "factorioTarget" t) = Just $ Target (read . TL.unpack $ t)
-    extractTarget _ = Nothing
-
-    firstJust (Just x:xs) = Just x
-    firstJust (_:xs) = firstJust xs
-    firstJust []     = Nothing
 
 
 testingGraph :: ProductionGraph
