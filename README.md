@@ -3,7 +3,7 @@
 Very early and experimental library for working with Factorio data. Assume it
 doesn't work. The solver is intended to be a port of
 [Foreman](https://bitbucket.org/Nicksaurus/foreman), but is a long way from
-being so.
+being so. It _should_ be platform agnostic, but I've only tried it on Ubuntu.
 
 All command line tools will require an existing Factorio installation:
 
